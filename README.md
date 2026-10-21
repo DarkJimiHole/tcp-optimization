@@ -37,9 +37,10 @@ tcp-tuning
 
 服务状态： 运行中 / 未运行 / 未安装
 BBR 状态： 已开启 / 未开启
-TCP 队列： fq / fq_codel / cake / pfifo_fast / 未知
+TCP 队列： fq / fq_codel / cake（出口整形） / pfifo_fast / 未知
 适用延迟： 80 ms
 带宽大小： 100 Mbps
+出口整形： 未开启 / 92 Mbps
 
 -----------------------------------------------
   1. 开启调优
@@ -47,11 +48,12 @@ TCP 队列： fq / fq_codel / cake / pfifo_fast / 未知
   3. 开启 BBR
   4. 关闭 BBR
   5. 修改延迟和带宽
-  6. 卸载脚本
+  6. 设置出口整形（cake）
+  7. 卸载脚本
   0. 退出
 -----------------------------------------------
 
-请输入选项 [0-6]:
+请输入选项 [0-7]:
 ```
 
 首次使用请先执行：
@@ -86,7 +88,9 @@ BDP(bytes) = 带宽(Mbps) × RTT(ms) × 125
 500 Mbps × 149 ms × 125 ≈ 9.3 MB
 ```
 
-脚本会把 TCP 收发缓冲上限设置为 `BDP × 4`，并限制在 `64 MiB` 到 `512 MiB` 之间。这个值是自动调节的上限，不代表每条连接都会立即占用这么多内存。
+脚本会把 TCP 收发缓冲上限设置为 `BDP × 3`，最小 `16 MiB`，最大取 `512 MiB` 与 `内存 / 8` 中的较小值。这个值是自动调节的上限，不代表每条连接都会立即占用这么多内存；按内存封顶是为了避免小内存 VPS 在慢客户端较多时触发 TCP 内存压力。
+
+取 3 倍的原因：BBR 在途数据最多约 2 × BDP，而接收缓冲只有约 50%-75% 能作为通告窗口（其余是 skb 元数据开销）。
 
 ## 转发链路说明
 
@@ -121,7 +125,27 @@ net.ipv4.tcp_rmem = 4096 131072 <calculated>
 net.ipv4.tcp_wmem = 4096 65536 <calculated>
 net.core.somaxconn = 8192
 net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_notsent_lowat = 131072
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.core.netdev_max_backlog = 16384
 ```
+
+- `tcp_notsent_lowat`：限制 socket 中未发送数据量，降低大发送缓冲下的内存占用和代理延迟抖动，也让 iperf3 发送端首秒速率不再虚高。
+- `tcp_slow_start_after_idle = 0`：长连接（代理、mux、HTTP/2）空闲后不再重新慢启动。
+- `tcp_mtu_probing = 1`：多层转发或隧道遇到 PMTU 黑洞时自动探测 MSS。
+- `netdev_max_backlog`：避免高 pps 时在软中断层丢包。
+
+队列：多队列网卡保留 `mq` 作为根，每个发送队列挂一个 `fq`，不会把所有队列合并成单个 `fq`。
+
+## 出口整形（可选）
+
+菜单 `6. 设置出口整形（cake）` 会把本机出口总速率压到设定值，让排队发生在本机 cake 中，而不是在上游限速器（policer）处被直接丢包。
+
+- 只在 BBR 稳定阶段重传仍然偏高、或实际使用卡顿时开启；只有启动阶段重传高属于 BBR 正常探测，不必处理。
+- 通常取瓶颈带宽的 90%-95%，留空回车会按 92% 给出建议值；输入 `0` 关闭。
+- 只作用于出口方向（VPS -> 客户端），需要内核提供 `sch_cake`（4.19+），开启调优后才生效。
+- cake 为单实例，高速率下会占用较多单核 CPU。
 
 脚本不会无脑开启：
 
@@ -140,6 +164,7 @@ net.ipv4.tcp_max_syn_backlog = 8192
 tcp-tuning              # 打开菜单
 tcp-tuning install      # 安装管理命令
 tcp-tuning config       # 修改延迟和带宽
+tcp-tuning shape        # 设置出口整形（cake）
 tcp-tuning enable       # 开启调优
 tcp-tuning disable      # 关闭调优
 tcp-tuning bbr-on       # 开启 BBR
@@ -168,7 +193,7 @@ sysctl net.ipv4.tcp_congestion_control
 在菜单中执行：
 
 ```text
-6. 卸载脚本
+7. 卸载脚本
 ```
 
 或运行：

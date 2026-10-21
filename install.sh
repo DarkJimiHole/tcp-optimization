@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # 上传到 GitHub 后，如需使用自己的 Raw 地址，可通过环境变量覆盖。
 SCRIPT_URL="${TCP_TUNING_SCRIPT_URL:-https://raw.githubusercontent.com/DarkJimiHole/tcp-optimization/main/install.sh}"
@@ -15,13 +15,18 @@ MODULES_FILE="/etc/modules-load.d/tcp-tuning.conf"
 SERVICE_NAME="tcp-tuning"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
-MIN_BUFFER_BYTES=$((64 * 1024 * 1024))
+MIN_BUFFER_BYTES=$((16 * 1024 * 1024))
 MAX_BUFFER_BYTES=$((512 * 1024 * 1024))
+FLOOR_BUFFER_BYTES=$((4 * 1024 * 1024))
+
+MAX_LATENCY_MS=10000
+MAX_BANDWIDTH_MBPS=1000000
 
 LATENCY_MS=""
 BANDWIDTH_MBPS=""
 TUNING_ENABLED=0
 BBR_ENABLED=0
+SHAPE_MBPS=0
 
 if [[ -t 1 ]]; then
     RED=$'\033[31m'
@@ -79,6 +84,7 @@ load_config() {
     BANDWIDTH_MBPS=""
     TUNING_ENABLED=0
     BBR_ENABLED=0
+    SHAPE_MBPS=0
 
     if [[ -f "${CONFIG_FILE}" ]]; then
         # shellcheck source=/dev/null
@@ -89,6 +95,7 @@ load_config() {
     is_positive_int "${BANDWIDTH_MBPS:-}" || BANDWIDTH_MBPS=""
     [[ "${TUNING_ENABLED:-0}" =~ ^[01]$ ]] || TUNING_ENABLED=0
     [[ "${BBR_ENABLED:-0}" =~ ^[01]$ ]] || BBR_ENABLED=0
+    is_positive_int "${SHAPE_MBPS:-}" || SHAPE_MBPS=0
 }
 
 save_config() {
@@ -103,6 +110,7 @@ save_config() {
         printf 'BANDWIDTH_MBPS=%s\n' "${BANDWIDTH_MBPS:-}"
         printf 'TUNING_ENABLED=%s\n' "${TUNING_ENABLED:-0}"
         printf 'BBR_ENABLED=%s\n' "${BBR_ENABLED:-0}"
+        printf 'SHAPE_MBPS=%s\n' "${SHAPE_MBPS:-0}"
     } >"${tmp}"
 
     install -m 600 "${tmp}" "${CONFIG_FILE}"
@@ -128,18 +136,33 @@ ceil_to_mib() {
     printf '%s\n' "$((((bytes + mib - 1) / mib) * mib))"
 }
 
+# Per-socket cap: at most 1/8 of RAM, so a few slow-client sockets on a small
+# VPS cannot push the whole box into TCP memory pressure.
+calc_buffer_cap() {
+    local mem_kb mem_cap
+    local cap="${MAX_BUFFER_BYTES}"
+
+    mem_kb="$(awk '$1 == "MemTotal:" {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+    if is_positive_int "${mem_kb}"; then
+        mem_cap=$((mem_kb * 1024 / 8))
+        ((mem_cap < cap)) && cap="${mem_cap}"
+    fi
+    ((cap < FLOOR_BUFFER_BYTES)) && cap="${FLOOR_BUFFER_BYTES}"
+
+    printf '%s\n' "${cap}"
+}
+
 calc_buffer_max() {
     local bdp="$1"
-    local target
+    local target cap
 
-    # Keep enough room for Linux packet metadata and advertised window overhead.
-    target=$((bdp * 4))
+    # BBR keeps up to ~2x BDP in flight, and only ~50-75% of rmem becomes
+    # advertised window (skb truesize overhead), so 3x BDP covers both sides.
+    target=$((bdp * 3))
+    cap="$(calc_buffer_cap)"
 
-    if ((target < MIN_BUFFER_BYTES)); then
-        target="${MIN_BUFFER_BYTES}"
-    elif ((target > MAX_BUFFER_BYTES)); then
-        target="${MAX_BUFFER_BYTES}"
-    fi
+    ((target < MIN_BUFFER_BYTES)) && target="${MIN_BUFFER_BYTES}"
+    ((target > cap)) && target="${cap}"
 
     ceil_to_mib "${target}"
 }
@@ -194,15 +217,21 @@ backup_current_sysctl() {
         "net.ipv4.tcp_wmem"
         "net.core.somaxconn"
         "net.ipv4.tcp_max_syn_backlog"
+        "net.ipv4.tcp_notsent_lowat"
+        "net.ipv4.tcp_slow_start_after_idle"
+        "net.ipv4.tcp_mtu_probing"
+        "net.core.netdev_max_backlog"
     )
-
-    [[ -f "${BACKUP_FILE}" ]] && return 0
 
     mkdir -p "${CONFIG_DIR}"
     chmod 700 "${CONFIG_DIR}" 2>/dev/null || true
 
     tmp="$(mktemp)"
+    # Keep existing entries (the true pre-tuning values) and only add keys
+    # introduced by newer versions, which this runs before applying.
+    [[ -f "${BACKUP_FILE}" ]] && cat "${BACKUP_FILE}" >"${tmp}"
     for key in "${keys[@]}"; do
+        grep -q "^${key//./\\.}=" "${tmp}" && continue
         value="$(sysctl_value "${key}" || true)"
         [[ -n "${value}" ]] && printf '%s=%s\n' "${key}" "${value}" >>"${tmp}"
     done
@@ -258,12 +287,24 @@ default_iface() {
 
     iface="$(ip -o -4 route show to default 2>/dev/null | awk '{print $5; exit}')"
     if [[ -z "${iface}" ]]; then
+        iface="$(ip -o -6 route show to default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+    fi
+    if [[ -z "${iface}" ]]; then
         iface="$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
     fi
 
     printf '%s\n' "${iface}"
 }
 
+tx_queue_count() {
+    local iface="$1"
+    local queues=(/sys/class/net/"${iface}"/queues/tx-*)
+
+    [[ -e "${queues[0]}" ]] || { printf '1\n'; return 0; }
+    printf '%s\n' "${#queues[@]}"
+}
+
+# Expects net.core.default_qdisc to already be set to the wanted qdisc.
 apply_qdisc() {
     local qdisc="${1:-fq}"
     local iface
@@ -274,8 +315,47 @@ apply_qdisc() {
     iface="$(default_iface)"
     [[ -n "${iface}" ]] || return 0
 
+    # On multiqueue NICs keep mq at the root; a fresh mq creates one
+    # default_qdisc child per TX queue instead of funnelling all queues
+    # through a single qdisc lock. Replacing an existing mq is a no-op that
+    # keeps stale children, so drop any tc-created root first (this fails
+    # harmlessly when the root is still the kernel default).
+    if (($(tx_queue_count "${iface}") > 1)); then
+        tc qdisc del dev "${iface}" root >/dev/null 2>&1 || true
+        tc qdisc replace dev "${iface}" root handle 1: mq >/dev/null 2>&1 && return 0
+    fi
+
     tc qdisc replace dev "${iface}" root "${qdisc}" >/dev/null 2>&1 || \
         warn "无法把 ${iface} 的 TCP 队列切换为 ${qdisc}，可能是内核未启用该 qdisc。"
+}
+
+# cake must be the single root qdisc to shape the aggregate rate.
+apply_cake_shaping() {
+    local mbps="$1"
+    local iface
+
+    has_cmd ip && has_cmd tc || return 1
+
+    iface="$(default_iface)"
+    [[ -n "${iface}" ]] || return 1
+
+    if has_cmd modprobe; then
+        modprobe sch_cake >/dev/null 2>&1 || true
+    fi
+
+    tc qdisc replace dev "${iface}" root cake bandwidth "${mbps}mbit" >/dev/null 2>&1
+}
+
+apply_managed_qdisc() {
+    load_config
+
+    if [[ "${TUNING_ENABLED}" == "1" && "${SHAPE_MBPS}" -gt 0 ]]; then
+        apply_cake_shaping "${SHAPE_MBPS}" && return 0
+        warn "无法启用 cake 整形（内核可能未提供 sch_cake），已改用 fq。"
+        apply_qdisc fq
+    elif [[ "${TUNING_ENABLED}" == "1" || "${BBR_ENABLED}" == "1" ]]; then
+        apply_qdisc fq
+    fi
 }
 
 restore_qdisc_from_backup() {
@@ -299,7 +379,11 @@ current_qdisc() {
         if [[ -n "${iface}" ]]; then
             qdisc="$(tc qdisc show dev "${iface}" 2>/dev/null | awk 'NR==1 {print $2}')"
             case "${qdisc}" in
-                fq|fq_codel|cake|pfifo_fast)
+                cake)
+                    printf '%s\n' "cake（出口整形）"
+                    return 0
+                    ;;
+                fq|fq_codel|pfifo_fast)
                     printf '%s\n' "${qdisc}"
                     return 0
                     ;;
@@ -354,6 +438,15 @@ bandwidth_text() {
         printf '%s Mbps' "${BANDWIDTH_MBPS}"
     else
         printf '%s' "未设置"
+    fi
+}
+
+shape_text() {
+    load_config
+    if [[ "${SHAPE_MBPS}" -gt 0 ]]; then
+        printf '%s Mbps' "${SHAPE_MBPS}"
+    else
+        printf '%s' "未开启"
     fi
 }
 
@@ -420,6 +513,10 @@ render_sysctl_file() {
             printf '%s\n' "net.ipv4.tcp_wmem = 4096 65536 ${buffer}"
             printf '%s\n' "net.core.somaxconn = 8192"
             printf '%s\n' "net.ipv4.tcp_max_syn_backlog = 8192"
+            printf '%s\n' "net.ipv4.tcp_notsent_lowat = 131072"
+            printf '%s\n' "net.ipv4.tcp_slow_start_after_idle = 0"
+            printf '%s\n' "net.ipv4.tcp_mtu_probing = 1"
+            printf '%s\n' "net.core.netdev_max_backlog = 16384"
         fi
     } >"${tmp}"
 
@@ -452,10 +549,7 @@ apply_now() {
         return 1
     fi
 
-    load_config
-    if [[ "${TUNING_ENABLED}" == "1" || "${BBR_ENABLED}" == "1" ]]; then
-        apply_qdisc fq
-    fi
+    apply_managed_qdisc
 }
 
 install_self() {
@@ -470,6 +564,15 @@ install_self() {
         return 0
     fi
 
+    # A local file is what the user actually ran (possibly edited), so it wins
+    # over the Raw URL; the download is only for `bash <(curl ...)` installs.
+    if [[ -r "${source_path}" && "${source_path}" != /dev/fd/* && "${source_path}" != /proc/*/fd/* ]]; then
+        install -m 755 "${source_path}" "${BIN_PATH}"
+        rm -f "${tmp}"
+        ok "tcp-tuning 命令已安装：${BIN_PATH}"
+        return 0
+    fi
+
     if [[ -n "${SCRIPT_URL}" ]] && has_cmd curl; then
         info "正在安装 tcp-tuning 命令..."
         if curl -fsSL "${SCRIPT_URL}" -o "${tmp}" && install -m 755 "${tmp}" "${BIN_PATH}"; then
@@ -477,14 +580,6 @@ install_self() {
             ok "tcp-tuning 命令已安装：${BIN_PATH}"
             return 0
         fi
-        warn "无法从 Raw 地址安装 tcp-tuning，尝试使用当前脚本。"
-    fi
-
-    if [[ -r "${source_path}" && "${source_path}" != /dev/fd/* && "${source_path}" != /proc/*/fd/* ]]; then
-        install -m 755 "${source_path}" "${BIN_PATH}"
-        rm -f "${tmp}"
-        ok "tcp-tuning 命令已安装：${BIN_PATH}"
-        return 0
     fi
 
     rm -f "${tmp}"
@@ -575,7 +670,7 @@ enable_tuning() {
         return 1
     fi
 
-    apply_qdisc fq
+    apply_managed_qdisc
     install_service || true
 
     if has_cmd systemctl && [[ -f "${SERVICE_FILE}" ]]; then
@@ -640,7 +735,7 @@ enable_bbr() {
         return 1
     fi
 
-    apply_qdisc fq
+    apply_managed_qdisc
 
     ok "BBR 已开启。"
 }
@@ -680,6 +775,7 @@ disable_bbr() {
 prompt_positive_int() {
     local prompt="$1"
     local default="${2:-}"
+    local max="${3:-}"
     local input
 
     while true; do
@@ -690,12 +786,12 @@ prompt_positive_int() {
             read -r -p "${prompt}: " input
         fi
 
-        if is_positive_int "${input}"; then
+        if is_positive_int "${input}" && { [[ -z "${max}" ]] || ((${#input} <= ${#max} && input <= max)); }; then
             printf '%s\n' "${input}"
             return 0
         fi
 
-        err "请输入正整数。"
+        err "请输入正整数${max:+（不超过 ${max}）}。"
     done
 }
 
@@ -716,8 +812,8 @@ modify_link_config() {
     info "RTT 请填写 ping 出来的往返延迟，例如 150。"
     printf '\n'
 
-    LATENCY_MS="$(prompt_positive_int "请输入 RTT 延迟，单位 ms" "${old_latency}")"
-    BANDWIDTH_MBPS="$(prompt_positive_int "请输入瓶颈带宽，单位 Mbps" "${old_bandwidth}")"
+    LATENCY_MS="$(prompt_positive_int "请输入 RTT 延迟，单位 ms" "${old_latency}" "${MAX_LATENCY_MS}")"
+    BANDWIDTH_MBPS="$(prompt_positive_int "请输入瓶颈带宽，单位 Mbps" "${old_bandwidth}" "${MAX_BANDWIDTH_MBPS}")"
     save_config
 
     link_summary || true
@@ -732,13 +828,68 @@ modify_link_config() {
             return 1
         fi
 
-        apply_qdisc fq
+        apply_managed_qdisc
         if has_cmd systemctl && [[ -f "${SERVICE_FILE}" ]]; then
             systemctl restart "${SERVICE_NAME}" >/dev/null 2>&1 || true
         fi
         ok "参数已更新并重新应用。"
     else
         ok "参数已保存。现在可以执行：1. 开启调优"
+    fi
+}
+
+modify_shaping() {
+    local input suggest
+
+    clear_screen
+    printf '%s\n' "${BOLD}设置出口整形（cake）${RESET}"
+    printf '%s\n\n' "----------------------------------------"
+
+    need_root
+    load_config
+
+    info "整形会把本机出口（VPS -> 客户端方向）总速率压到设定值，"
+    info "让排队发生在本机 cake 中，而不是在上游限速器处被直接丢包。"
+    info "只在稳定阶段重传仍然偏高时才建议开启，通常取瓶颈带宽的 90%-95%。"
+    info "输入 0 关闭整形。"
+    printf '\n'
+
+    suggest="${SHAPE_MBPS}"
+    if [[ "${suggest}" -eq 0 && -n "${BANDWIDTH_MBPS}" ]]; then
+        suggest=$((BANDWIDTH_MBPS * 92 / 100))
+        ((suggest > 0)) || suggest=1
+    fi
+
+    while true; do
+        read -r -p "请输入整形速率，单位 Mbps [${suggest}]: " input
+        input="${input:-${suggest}}"
+        if [[ "${input}" == "0" ]] || { is_positive_int "${input}" && ((${#input} <= ${#MAX_BANDWIDTH_MBPS} && input <= MAX_BANDWIDTH_MBPS)); }; then
+            break
+        fi
+        err "请输入 0 或不超过 ${MAX_BANDWIDTH_MBPS} 的正整数。"
+    done
+
+    SHAPE_MBPS="${input}"
+    save_config
+
+    if [[ "${TUNING_ENABLED}" != "1" ]]; then
+        ok "已保存，开启调优后生效。"
+        return 0
+    fi
+
+    if [[ "${SHAPE_MBPS}" -gt 0 ]]; then
+        if apply_cake_shaping "${SHAPE_MBPS}"; then
+            ok "cake 出口整形已开启：${SHAPE_MBPS} Mbps"
+        else
+            SHAPE_MBPS=0
+            save_config
+            apply_managed_qdisc
+            err "无法启用 cake 整形，内核可能未提供 sch_cake。已关闭整形并恢复 fq。"
+            return 1
+        fi
+    else
+        apply_managed_qdisc
+        ok "出口整形已关闭，已恢复 fq。"
     fi
 }
 
@@ -786,6 +937,7 @@ show_main_menu() {
     printf 'TCP 队列： %s\n' "$(current_qdisc)"
     printf '适用延迟： %s\n' "$(latency_text)"
     printf '带宽大小： %s\n' "$(bandwidth_text)"
+    printf '出口整形： %s\n' "$(shape_text)"
     printf '\n'
     printf '%s\n' "-----------------------------------------------"
     printf '%s\n' "  1. 开启调优"
@@ -793,7 +945,8 @@ show_main_menu() {
     printf '%s\n' "  3. 开启 BBR"
     printf '%s\n' "  4. 关闭 BBR"
     printf '%s\n' "  5. 修改延迟和带宽"
-    printf '%s\n' "  6. 卸载脚本"
+    printf '%s\n' "  6. 设置出口整形（cake）"
+    printf '%s\n' "  7. 卸载脚本"
     printf '%s\n' "  0. 退出"
     printf '%s\n' "-----------------------------------------------"
     printf '\n'
@@ -806,7 +959,7 @@ main_menu() {
 
     while true; do
         show_main_menu
-        read -r -p "请输入选项 [0-6]: " choice
+        read -r -p "请输入选项 [0-7]: " choice
 
         case "${choice}" in
             1) enable_tuning || true; pause ;;
@@ -814,9 +967,10 @@ main_menu() {
             3) enable_bbr || true; pause ;;
             4) disable_bbr || true; pause ;;
             5) modify_link_config || true; pause ;;
-            6) uninstall_all || true; pause ;;
+            6) modify_shaping || true; pause ;;
+            7) uninstall_all || true; pause ;;
             0) exit 0 ;;
-            *) err "请输入 0-6。"; pause ;;
+            *) err "请输入 0-7。"; pause ;;
         esac
     done
 }
@@ -851,6 +1005,9 @@ case "${1:-}" in
     config|--config)
         modify_link_config
         ;;
+    shape|--shape)
+        modify_shaping
+        ;;
     uninstall|--uninstall)
         uninstall_all
         ;;
@@ -866,7 +1023,7 @@ case "${1:-}" in
         ;;
     *)
         err "未知参数：$1"
-        printf '%s\n' "用法：$0 [install|menu|apply|enable|disable|bbr-on|bbr-off|config|uninstall]"
+        printf '%s\n' "用法：$0 [install|menu|apply|enable|disable|bbr-on|bbr-off|config|shape|uninstall]"
         exit 1
         ;;
 esac
