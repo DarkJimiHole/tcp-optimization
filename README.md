@@ -37,10 +37,10 @@ tcp-tuning
 
 服务状态： 运行中 / 未运行 / 未安装
 BBR 状态： 已开启 / 未开启
-TCP 队列： fq / fq_codel / cake（出口整形） / pfifo_fast / 未知
+TCP 队列： fq / fq（HTB 出口整形） / fq_codel / cake / pfifo_fast / 未知
 适用延迟： 80 ms
 带宽大小： 100 Mbps
-出口整形： 未开启 / 92 Mbps
+出口整形： 未开启 / 90 Mbps
 
 -----------------------------------------------
   1. 开启调优
@@ -48,7 +48,7 @@ TCP 队列： fq / fq_codel / cake（出口整形） / pfifo_fast / 未知
   3. 开启 BBR
   4. 关闭 BBR
   5. 修改延迟和带宽
-  6. 设置出口整形（cake）
+  6. 设置出口整形（HTB）
   7. 卸载脚本
   0. 退出
 -----------------------------------------------
@@ -140,12 +140,15 @@ net.core.netdev_max_backlog = 16384
 
 ## 出口整形（可选）
 
-菜单 `6. 设置出口整形（cake）` 会把本机出口总速率压到设定值，让排队发生在本机 cake 中，而不是在上游限速器（policer）处被直接丢包。
+菜单 `6. 设置出口整形（HTB）` 用 HTB 把本机出口总速率压到设定值，叶子队列仍是 `fq`，BBR 继续使用 fq pacing。排队发生在本机，而不是在上游限速器（policer）处被直接丢包。
+
+实测（300M 端口、RTT 156ms、BBR）：不整形 249 Mbps / 重传约 3%；HTB 270M 251 Mbps / 重传约 0.3%。同一台 1 vCPU VPS 上 cake 270M 只有约 110 Mbps，因此不使用 cake。
 
 - 只在 BBR 稳定阶段重传仍然偏高、或实际使用卡顿时开启；只有启动阶段重传高属于 BBR 正常探测，不必处理。
-- 通常取瓶颈带宽的 90%-95%，留空回车会按 92% 给出建议值；输入 `0` 关闭。
-- 只作用于出口方向（VPS -> 客户端），需要内核提供 `sch_cake`（4.19+），开启调优后才生效。
-- cake 为单实例，高速率下会占用较多单核 CPU。
+- 适合 VPS 端口有限速器的情况：用 `iperf3 -R --fq-rate` 逐档测试，重传在某个速率以上突然升高，即为限速点。
+- 通常取端口带宽的 90% 左右，留空回车会按 90% 给出建议值；输入 `0` 关闭。
+- 整形只降低重传、不会提升速率；开启后请与不整形时对比，确认有收益再保留。
+- 只作用于出口方向（VPS -> 客户端），开启调优后才生效。整形时根队列为单个 HTB，不再使用多队列 `mq`。
 
 脚本不会无脑开启：
 
@@ -164,7 +167,7 @@ net.core.netdev_max_backlog = 16384
 tcp-tuning              # 打开菜单
 tcp-tuning install      # 安装管理命令
 tcp-tuning config       # 修改延迟和带宽
-tcp-tuning shape        # 设置出口整形（cake）
+tcp-tuning shape        # 设置出口整形（HTB）
 tcp-tuning enable       # 开启调优
 tcp-tuning disable      # 关闭调优
 tcp-tuning bbr-on       # 开启 BBR

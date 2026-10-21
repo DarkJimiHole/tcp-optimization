@@ -329,8 +329,10 @@ apply_qdisc() {
         warn "无法把 ${iface} 的 TCP 队列切换为 ${qdisc}，可能是内核未启用该 qdisc。"
 }
 
-# cake must be the single root qdisc to shape the aggregate rate.
-apply_cake_shaping() {
+# HTB at the root caps the aggregate rate and keeps fq as the leaf, so BBR
+# still gets fq pacing. cake was dropped: it shapes per segment and leaves BBR
+# on internal pacing, which capped a 270 Mbit test at ~110 Mbit on a 1 vCPU VPS.
+apply_shaping() {
     local mbps="$1"
     local iface
 
@@ -339,19 +341,20 @@ apply_cake_shaping() {
     iface="$(default_iface)"
     [[ -n "${iface}" ]] || return 1
 
-    if has_cmd modprobe; then
-        modprobe sch_cake >/dev/null 2>&1 || true
-    fi
-
-    tc qdisc replace dev "${iface}" root cake bandwidth "${mbps}mbit" >/dev/null 2>&1
+    # Rebuild from scratch so a rate change never leaves a stale class behind.
+    tc qdisc del dev "${iface}" root >/dev/null 2>&1 || true
+    tc qdisc replace dev "${iface}" root handle 1: htb default 10 >/dev/null 2>&1 &&
+        tc class add dev "${iface}" parent 1: classid 1:10 htb \
+            rate "${mbps}mbit" ceil "${mbps}mbit" quantum 60000 >/dev/null 2>&1 &&
+        tc qdisc add dev "${iface}" parent 1:10 fq >/dev/null 2>&1
 }
 
 apply_managed_qdisc() {
     load_config
 
     if [[ "${TUNING_ENABLED}" == "1" && "${SHAPE_MBPS}" -gt 0 ]]; then
-        apply_cake_shaping "${SHAPE_MBPS}" && return 0
-        warn "无法启用 cake 整形（内核可能未提供 sch_cake），已改用 fq。"
+        apply_shaping "${SHAPE_MBPS}" && return 0
+        warn "无法启用 HTB 出口整形，已改用 fq。"
         apply_qdisc fq
     elif [[ "${TUNING_ENABLED}" == "1" || "${BBR_ENABLED}" == "1" ]]; then
         apply_qdisc fq
@@ -379,8 +382,8 @@ current_qdisc() {
         if [[ -n "${iface}" ]]; then
             qdisc="$(tc qdisc show dev "${iface}" 2>/dev/null | awk 'NR==1 {print $2}')"
             case "${qdisc}" in
-                cake)
-                    printf '%s\n' "cake（出口整形）"
+                htb)
+                    printf '%s\n' "fq（HTB 出口整形）"
                     return 0
                     ;;
                 fq|fq_codel|pfifo_fast)
@@ -842,21 +845,22 @@ modify_shaping() {
     local input suggest
 
     clear_screen
-    printf '%s\n' "${BOLD}设置出口整形（cake）${RESET}"
+    printf '%s\n' "${BOLD}设置出口整形（HTB）${RESET}"
     printf '%s\n\n' "----------------------------------------"
 
     need_root
     load_config
 
     info "整形会把本机出口（VPS -> 客户端方向）总速率压到设定值，"
-    info "让排队发生在本机 cake 中，而不是在上游限速器处被直接丢包。"
-    info "只在稳定阶段重传仍然偏高时才建议开启，通常取瓶颈带宽的 90%-95%。"
+    info "让排队发生在本机，而不是在上游限速器处被直接丢包。"
+    info "适合 VPS 端口有限速器、不限速时重传偏高的情况，通常取端口带宽的 90% 左右。"
+    info "开启后请用 iperf3 与不整形时对比速率和重传，确认有收益再保留。"
     info "输入 0 关闭整形。"
     printf '\n'
 
     suggest="${SHAPE_MBPS}"
     if [[ "${suggest}" -eq 0 && -n "${BANDWIDTH_MBPS}" ]]; then
-        suggest=$((BANDWIDTH_MBPS * 92 / 100))
+        suggest=$((BANDWIDTH_MBPS * 90 / 100))
         ((suggest > 0)) || suggest=1
     fi
 
@@ -878,13 +882,13 @@ modify_shaping() {
     fi
 
     if [[ "${SHAPE_MBPS}" -gt 0 ]]; then
-        if apply_cake_shaping "${SHAPE_MBPS}"; then
-            ok "cake 出口整形已开启：${SHAPE_MBPS} Mbps"
+        if apply_shaping "${SHAPE_MBPS}"; then
+            ok "HTB 出口整形已开启：${SHAPE_MBPS} Mbps"
         else
             SHAPE_MBPS=0
             save_config
             apply_managed_qdisc
-            err "无法启用 cake 整形，内核可能未提供 sch_cake。已关闭整形并恢复 fq。"
+            err "无法启用 HTB 出口整形，已关闭整形并恢复 fq。"
             return 1
         fi
     else
@@ -945,7 +949,7 @@ show_main_menu() {
     printf '%s\n' "  3. 开启 BBR"
     printf '%s\n' "  4. 关闭 BBR"
     printf '%s\n' "  5. 修改延迟和带宽"
-    printf '%s\n' "  6. 设置出口整形（cake）"
+    printf '%s\n' "  6. 设置出口整形（HTB）"
     printf '%s\n' "  7. 卸载脚本"
     printf '%s\n' "  0. 退出"
     printf '%s\n' "-----------------------------------------------"
